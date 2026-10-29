@@ -4,8 +4,10 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"os"
 	"path"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -291,6 +293,7 @@ func (c *StoreClient) checkMagnet(params *store.CheckMagnetParams, includeLinkAn
 				}
 
 				items := []store.AddMagnetData{}
+				cachedIdxs := []int{}
 				for idx, is_cached := range res.Data.Response {
 					magnet, err := core.ParseMagnetLink(ccParams.Items[idx])
 					if err != nil {
@@ -313,17 +316,34 @@ func (c *StoreClient) checkMagnet(params *store.CheckMagnetParams, includeLinkAn
 
 					if is_cached {
 						item.Status = store.MagnetStatusCached
-
-						files, err := c.getCachedMagnetFiles(params.APIKey, item.Magnet, includeLinkAndPath)
-						if err != nil {
-							hasError = true
-							errs[i] = err
-							return
-						}
-						item.Files = files
+						cachedIdxs = append(cachedIdxs, len(items))
 					}
 
 					items = append(items, item)
+				}
+
+				// [local patch] fetch file lists for cached magnets concurrently
+				// instead of one request after another.
+				fileErrs := make([]error, len(cachedIdxs))
+				sem := make(chan struct{}, premiumizeFilesConcurrency)
+				var fwg sync.WaitGroup
+				for j, itemIdx := range cachedIdxs {
+					fwg.Go(func() {
+						sem <- struct{}{}
+						defer func() { <-sem }()
+						files, err := c.getCachedMagnetFiles(params.APIKey, items[itemIdx].Magnet, includeLinkAndPath)
+						if err != nil {
+							fileErrs[j] = err
+							return
+						}
+						items[itemIdx].Files = files
+					})
+				}
+				fwg.Wait()
+				if err := errors.Join(fileErrs...); err != nil {
+					hasError = true
+					errs[i] = err
+					return
 				}
 
 				cItems[i] = items
@@ -418,6 +438,15 @@ func getTransferById(c *StoreClient, apiKey string, id string) (*ListTransfersDa
 	}
 	return nil, nil
 }
+
+// [local patch] number of parallel directdl calls when listing files of
+// cached magnets. Override with STREMTHRU_PREMIUMIZE_FILES_CONCURRENCY.
+var premiumizeFilesConcurrency = func() int {
+	if v, err := strconv.Atoi(os.Getenv("STREMTHRU_PREMIUMIZE_FILES_CONCURRENCY")); err == nil && v > 0 {
+		return v
+	}
+	return 8
+}()
 
 type CachedMagnetId string
 

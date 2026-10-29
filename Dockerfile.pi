@@ -1,0 +1,26 @@
+FROM golang:1.26-alpine AS builder
+RUN apk add --no-cache build-base
+WORKDIR /workspace
+COPY go.mod go.sum ./
+RUN go mod download
+COPY migrations ./migrations
+COPY core ./core
+COPY internal ./internal
+COPY store ./store
+COPY stremio ./stremio
+COPY *.go ./
+# dashboard-ul web nu e inclus (cere build Node); API-ul functioneaza normal
+RUN printf '<!doctype html><title>StremThru</title><p>Build local cu patch Premiumize (fara dashboard)</p>' > internal/dash/fs/index.html
+ENV CGO_ENABLED=1
+RUN go build --tags 'sqlite_fts5,sqlite_stat4' -ldflags='-s -w' -o stremthru
+
+FROM alpine
+RUN apk add --no-cache git ffmpeg tini mimalloc2
+WORKDIR /app
+COPY --from=builder /workspace/stremthru ./stremthru
+VOLUME ["/app/data"]
+ENV STREMTHRU_ENV=prod
+ENV LD_PRELOAD=/usr/lib/libmimalloc.so.2
+EXPOSE 8080
+ENTRYPOINT ["/sbin/tini", "--"]
+CMD ["./stremthru"]
