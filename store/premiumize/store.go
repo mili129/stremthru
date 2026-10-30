@@ -293,7 +293,6 @@ func (c *StoreClient) checkMagnet(params *store.CheckMagnetParams, includeLinkAn
 				}
 
 				items := []store.AddMagnetData{}
-				cachedIdxs := []int{}
 				for idx, is_cached := range res.Data.Response {
 					magnet, err := core.ParseMagnetLink(ccParams.Items[idx])
 					if err != nil {
@@ -316,34 +315,9 @@ func (c *StoreClient) checkMagnet(params *store.CheckMagnetParams, includeLinkAn
 
 					if is_cached {
 						item.Status = store.MagnetStatusCached
-						cachedIdxs = append(cachedIdxs, len(items))
 					}
 
 					items = append(items, item)
-				}
-
-				// [local patch] fetch file lists for cached magnets concurrently
-				// instead of one request after another.
-				fileErrs := make([]error, len(cachedIdxs))
-				sem := make(chan struct{}, premiumizeFilesConcurrency)
-				var fwg sync.WaitGroup
-				for j, itemIdx := range cachedIdxs {
-					fwg.Go(func() {
-						sem <- struct{}{}
-						defer func() { <-sem }()
-						files, err := c.getCachedMagnetFiles(params.APIKey, items[itemIdx].Magnet, includeLinkAndPath)
-						if err != nil {
-							fileErrs[j] = err
-							return
-						}
-						items[itemIdx].Files = files
-					})
-				}
-				fwg.Wait()
-				if err := errors.Join(fileErrs...); err != nil {
-					hasError = true
-					errs[i] = err
-					return
 				}
 
 				cItems[i] = items
@@ -351,8 +325,57 @@ func (c *StoreClient) checkMagnet(params *store.CheckMagnetParams, includeLinkAn
 		}
 		wg.Wait()
 
-		if hasError {
+		// [local patch] a failed chunk no longer discards the other chunks;
+		// fail only if every chunk failed.
+		if hasError && !slices.ContainsFunc(cItems, func(items []store.AddMagnetData) bool { return items != nil }) {
 			return nil, errors.Join(errs...)
+		}
+
+		// [local patch] fetch file lists only for the cached magnets allowed by
+		// STREMTHRU_PREMIUMIZE_FILES_LIMITS, concurrently. Magnets without files
+		// are not stored in magnet_cache, so skipped or failed ones are
+		// checked again next time.
+		type cachedRef struct{ chunk, idx int }
+		refs := []cachedRef{}
+		candidates := []filesCandidate{}
+		for ci, items := range cItems {
+			for idx, item := range items {
+				if item.Status == store.MagnetStatusCached {
+					refs = append(refs, cachedRef{ci, idx})
+					candidates = append(candidates, filesCandidate{name: item.Name, size: item.Size})
+				}
+			}
+		}
+		selected := selectForFiles(candidates, premiumizeFilesLimits)
+		fileErrs := make([]error, len(selected))
+		sem := make(chan struct{}, premiumizeFilesConcurrency)
+		var fwg sync.WaitGroup
+		for j, sel := range selected {
+			ref := refs[sel]
+			fwg.Go(func() {
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				item := &cItems[ref.chunk][ref.idx]
+				files, err := c.getCachedMagnetFiles(params.APIKey, item.Magnet, includeLinkAndPath)
+				if err != nil {
+					fileErrs[j] = err
+					return
+				}
+				item.Files = files
+			})
+		}
+		fwg.Wait()
+		failed := 0
+		for _, err := range fileErrs {
+			if err != nil {
+				failed++
+			}
+		}
+		if hasError || failed > 0 || len(selected) < len(refs) {
+			log.Info("cached magnet files", "hashes", len(missingHashes), "cached", len(refs), "fetched", len(selected)-failed, "skipped", len(refs)-len(selected), "failed", failed, "first_error", firstError(append(fileErrs, errs...)))
+		}
+		if failed > 0 && failed == len(selected) {
+			return nil, errors.Join(fileErrs...)
 		}
 
 		for _, items := range cItems {
