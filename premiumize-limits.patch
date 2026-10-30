@@ -1,0 +1,312 @@
+diff --git a/store/premiumize/files_limit.go b/store/premiumize/files_limit.go
+new file mode 100644
+index 0000000..f83f195
+--- /dev/null
++++ b/store/premiumize/files_limit.go
+@@ -0,0 +1,109 @@
++package premiumize
++
++// [local patch] limit how many cached magnets get a file listing (directdl)
++// per check, per resolution. Each directdl is one Premiumize API call and a
++// popular title can have hundreds of cached torrents, which triggers
++// Premiumize's rate limit (429).
++//
++// STREMTHRU_PREMIUMIZE_FILES_LIMITS=2160p:25,1080p:25,720p:0,unknown:10
++//   n  -> at most n per check, largest first
++//   0  -> none (the magnet stays "cached" but without files)
++//   -1 -> no limit (same for resolutions not listed)
++
++import (
++	"cmp"
++	"fmt"
++	"os"
++	"regexp"
++	"slices"
++	"strconv"
++	"strings"
++)
++
++const resolutionUnknown = "unknown"
++
++var knownResolutions = []string{"2160p", "1440p", "1080p", "720p", "576p", "480p", "360p", "240p", "144p", resolutionUnknown}
++
++var (
++	resolution4kRegex  = regexp.MustCompile(`(^|[^a-z0-9])(4k|uhd)([^a-z0-9]|$)`)
++	resolutionNumRegex = regexp.MustCompile(`(^|[^a-z0-9])(2160|1440|1080|720|576|480|360|240|144)[pi]([^a-z0-9]|$)`)
++)
++
++func detectResolution(name string) string {
++	name = strings.ToLower(name)
++	if m := resolutionNumRegex.FindStringSubmatch(name); m != nil {
++		return m[2] + "p"
++	}
++	if resolution4kRegex.MatchString(name) {
++		return "2160p"
++	}
++	return resolutionUnknown
++}
++
++func parseFilesLimits(value string) (map[string]int, error) {
++	limits := map[string]int{}
++	for part := range strings.SplitSeq(value, ",") {
++		part = strings.TrimSpace(part)
++		if part == "" {
++			continue
++		}
++		res, n, ok := strings.Cut(part, ":")
++		res = strings.ToLower(strings.TrimSpace(res))
++		if !ok || !slices.Contains(knownResolutions, res) {
++			return nil, fmt.Errorf("invalid entry %q (expected <resolution>:<n>, resolution one of %s)", part, strings.Join(knownResolutions, ", "))
++		}
++		limit, err := strconv.Atoi(strings.TrimSpace(n))
++		if err != nil || limit < -1 {
++			return nil, fmt.Errorf("invalid limit in %q (expected -1, 0 or a positive number)", part)
++		}
++		limits[res] = limit
++	}
++	return limits, nil
++}
++
++var premiumizeFilesLimits = func() map[string]int {
++	limits, err := parseFilesLimits(os.Getenv("STREMTHRU_PREMIUMIZE_FILES_LIMITS"))
++	if err != nil {
++		log.Error("ignoring STREMTHRU_PREMIUMIZE_FILES_LIMITS", "error", err)
++		return map[string]int{}
++	}
++	return limits
++}()
++
++type filesCandidate struct {
++	name string
++	size int64
++}
++
++// selectForFiles returns the indexes of candidates that should get a file
++// listing: per resolution, the largest ones up to that resolution's limit.
++func selectForFiles(candidates []filesCandidate, limits map[string]int) []int {
++	byRes := map[string][]int{}
++	for i, c := range candidates {
++		res := detectResolution(c.name)
++		byRes[res] = append(byRes[res], i)
++	}
++	selected := []int{}
++	for res, idxs := range byRes {
++		limit, ok := limits[res]
++		if !ok || limit < 0 || limit >= len(idxs) {
++			selected = append(selected, idxs...)
++			continue
++		}
++		slices.SortStableFunc(idxs, func(a, b int) int {
++			return cmp.Compare(candidates[b].size, candidates[a].size)
++		})
++		selected = append(selected, idxs[:limit]...)
++	}
++	slices.Sort(selected)
++	return selected
++}
++
++func firstError(errs []error) error {
++	for _, err := range errs {
++		if err != nil {
++			return err
++		}
++	}
++	return nil
++}
+diff --git a/store/premiumize/files_limit_test.go b/store/premiumize/files_limit_test.go
+new file mode 100644
+index 0000000..aa782e8
+--- /dev/null
++++ b/store/premiumize/files_limit_test.go
+@@ -0,0 +1,83 @@
++package premiumize
++
++import (
++	"slices"
++	"testing"
++)
++
++func TestDetectResolution(t *testing.T) {
++	for name, want := range map[string]string{
++		"The.Matrix.1999.2160p.UHD.BluRay.REMUX.HDR.HEVC": "2160p",
++		"The Matrix (1999) 4K HDR":                         "2160p",
++		"The_Matrix_1999_UHD_BluRay":                       "2160p",
++		"The.Matrix.1999.1080p.BluRay.x264":                "1080p",
++		"The_Matrix_1999_1080p_BluRay":                     "1080p",
++		"Matrix.1999.1080i.HDTV":                           "1080p",
++		"The.Matrix.1999.720p.BRRip":                       "720p",
++		"The.Matrix.1999.480p.DVDRip":                      "480p",
++		"The.Matrix.1999.DVDRip.XviD":                      "unknown",
++		"Matrix.1999.x1080p.weird":                         "unknown",
++		"Movie.Title.1080p.and.2160p.Pack":                 "1080p",
++		"Avengers.Endgame.2019.IMAX.2160p":                 "2160p",
++		"Taken.4kids.edition":                              "unknown",
++	} {
++		if got := detectResolution(name); got != want {
++			t.Errorf("detectResolution(%q) = %q, want %q", name, got, want)
++		}
++	}
++}
++
++func TestParseFilesLimits(t *testing.T) {
++	limits, err := parseFilesLimits(" 2160p:25, 1080P:25,720p:0,unknown:-1 ,")
++	if err != nil {
++		t.Fatal(err)
++	}
++	want := map[string]int{"2160p": 25, "1080p": 25, "720p": 0, "unknown": -1}
++	if len(limits) != len(want) {
++		t.Fatalf("got %v, want %v", limits, want)
++	}
++	for k, v := range want {
++		if limits[k] != v {
++			t.Errorf("limits[%s] = %d, want %d", k, limits[k], v)
++		}
++	}
++
++	if limits, err := parseFilesLimits(""); err != nil || len(limits) != 0 {
++		t.Errorf("empty value: got %v, %v", limits, err)
++	}
++	for _, bad := range []string{"2160p", "8k:5", "1080p:x", "1080p:-2"} {
++		if _, err := parseFilesLimits(bad); err == nil {
++			t.Errorf("parseFilesLimits(%q) should fail", bad)
++		}
++	}
++}
++
++func TestSelectForFiles(t *testing.T) {
++	candidates := []filesCandidate{
++		{"A.2160p", 40},  // 0
++		{"B.2160p", 60},  // 1
++		{"C.2160p", 50},  // 2
++		{"D.1080p", 10},  // 3
++		{"E.1080p", 30},  // 4
++		{"F.720p", 5},    // 5
++		{"G.720p", 6},    // 6
++		{"H.DVDRip", 1},  // 7
++		{"I.480p", 2},    // 8
++		{"J.2160p", -1},  // 9 unknown size goes last
++	}
++	limits := map[string]int{"2160p": 2, "1080p": 5, "720p": 0, "unknown": 1}
++	// 2160p: two largest (B, C); 1080p: both (under limit); 720p: none;
++	// unknown: one; 480p: not listed -> no limit.
++	want := []int{1, 2, 3, 4, 7, 8}
++	if got := selectForFiles(candidates, limits); !slices.Equal(got, want) {
++		t.Errorf("got %v, want %v", got, want)
++	}
++
++	all := []int{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}
++	if got := selectForFiles(candidates, map[string]int{}); !slices.Equal(got, all) {
++		t.Errorf("no limits: got %v, want %v", got, all)
++	}
++	if got := selectForFiles(nil, limits); len(got) != 0 {
++		t.Errorf("no candidates: got %v", got)
++	}
++}
+diff --git a/store/premiumize/store.go b/store/premiumize/store.go
+index 5e211c4..45a7c97 100644
+--- a/store/premiumize/store.go
++++ b/store/premiumize/store.go
+@@ -293,7 +293,6 @@ func (c *StoreClient) checkMagnet(params *store.CheckMagnetParams, includeLinkAn
+ 				}
+ 
+ 				items := []store.AddMagnetData{}
+-				cachedIdxs := []int{}
+ 				for idx, is_cached := range res.Data.Response {
+ 					magnet, err := core.ParseMagnetLink(ccParams.Items[idx])
+ 					if err != nil {
+@@ -316,45 +315,69 @@ func (c *StoreClient) checkMagnet(params *store.CheckMagnetParams, includeLinkAn
+ 
+ 					if is_cached {
+ 						item.Status = store.MagnetStatusCached
+-						cachedIdxs = append(cachedIdxs, len(items))
+ 					}
+ 
+ 					items = append(items, item)
+ 				}
+ 
+-				// [local patch] fetch file lists for cached magnets concurrently
+-				// instead of one request after another.
+-				fileErrs := make([]error, len(cachedIdxs))
+-				sem := make(chan struct{}, premiumizeFilesConcurrency)
+-				var fwg sync.WaitGroup
+-				for j, itemIdx := range cachedIdxs {
+-					fwg.Go(func() {
+-						sem <- struct{}{}
+-						defer func() { <-sem }()
+-						files, err := c.getCachedMagnetFiles(params.APIKey, items[itemIdx].Magnet, includeLinkAndPath)
+-						if err != nil {
+-							fileErrs[j] = err
+-							return
+-						}
+-						items[itemIdx].Files = files
+-					})
+-				}
+-				fwg.Wait()
+-				if err := errors.Join(fileErrs...); err != nil {
+-					hasError = true
+-					errs[i] = err
+-					return
+-				}
+-
+ 				cItems[i] = items
+ 			})
+ 		}
+ 		wg.Wait()
+ 
+-		if hasError {
++		// [local patch] a failed chunk no longer discards the other chunks;
++		// fail only if every chunk failed.
++		if hasError && !slices.ContainsFunc(cItems, func(items []store.AddMagnetData) bool { return items != nil }) {
+ 			return nil, errors.Join(errs...)
+ 		}
+ 
++		// [local patch] fetch file lists only for the cached magnets allowed by
++		// STREMTHRU_PREMIUMIZE_FILES_LIMITS, concurrently. Magnets without files
++		// are not stored in magnet_cache, so skipped or failed ones are
++		// checked again next time.
++		type cachedRef struct{ chunk, idx int }
++		refs := []cachedRef{}
++		candidates := []filesCandidate{}
++		for ci, items := range cItems {
++			for idx, item := range items {
++				if item.Status == store.MagnetStatusCached {
++					refs = append(refs, cachedRef{ci, idx})
++					candidates = append(candidates, filesCandidate{name: item.Name, size: item.Size})
++				}
++			}
++		}
++		selected := selectForFiles(candidates, premiumizeFilesLimits)
++		fileErrs := make([]error, len(selected))
++		sem := make(chan struct{}, premiumizeFilesConcurrency)
++		var fwg sync.WaitGroup
++		for j, sel := range selected {
++			ref := refs[sel]
++			fwg.Go(func() {
++				sem <- struct{}{}
++				defer func() { <-sem }()
++				item := &cItems[ref.chunk][ref.idx]
++				files, err := c.getCachedMagnetFiles(params.APIKey, item.Magnet, includeLinkAndPath)
++				if err != nil {
++					fileErrs[j] = err
++					return
++				}
++				item.Files = files
++			})
++		}
++		fwg.Wait()
++		failed := 0
++		for _, err := range fileErrs {
++			if err != nil {
++				failed++
++			}
++		}
++		if hasError || failed > 0 || len(selected) < len(refs) {
++			log.Info("cached magnet files", "hashes", len(missingHashes), "cached", len(refs), "fetched", len(selected)-failed, "skipped", len(refs)-len(selected), "failed", failed, "first_error", firstError(append(fileErrs, errs...)))
++		}
++		if failed > 0 && failed == len(selected) {
++			return nil, errors.Join(fileErrs...)
++		}
++
+ 		for _, items := range cItems {
+ 			for _, item := range items {
+ 				itemByHash[strings.ToLower(item.Hash)] = item
