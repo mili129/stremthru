@@ -346,7 +346,16 @@ func (c *StoreClient) checkMagnet(params *store.CheckMagnetParams, includeLinkAn
 				}
 			}
 		}
-		selected := selectForFiles(candidates, premiumizeFilesLimits)
+		// [local patch] includeLinkAndPath is true only from AddMagnet (playback):
+		// the user picked this torrent, so always list its files. The limits
+		// are meant for the big availability checks, and a "." name without a
+		// resolution hint would otherwise be skipped and playback would fail
+		// with no video files.
+		limits := premiumizeFilesLimits
+		if includeLinkAndPath {
+			limits = nil
+		}
+		selected := selectForFiles(candidates, limits)
 		fileErrs := make([]error, len(selected))
 		sem := make(chan struct{}, premiumizeFilesConcurrency)
 		var fwg sync.WaitGroup
