@@ -98,3 +98,15 @@ func TestSelectForFilesWithHints(t *testing.T) {
 		t.Errorf("got %v, want %v", got, want)
 	}
 }
+
+func TestSelectForFilesNoLimits(t *testing.T) {
+	// playback (AddMagnet) passes nil limits: "." names must still be listed
+	candidates := []filesCandidate{{name: ".", size: 10}, {name: ".", size: 20}}
+	limits := map[string]int{"unknown": 0}
+	if got := selectForFiles(candidates, limits); len(got) != 0 {
+		t.Fatalf("with unknown:0 got %v, want none", got)
+	}
+	if got := selectForFiles(candidates, nil); len(got) != 2 {
+		t.Fatalf("with nil limits got %v, want both", got)
+	}
+}
