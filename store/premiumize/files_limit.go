@@ -73,6 +73,24 @@ var premiumizeFilesLimits = func() map[string]int {
 type filesCandidate struct {
 	name string
 	size int64
+	hint string // [local patch] resolution sent by the client, used when name has none
+}
+
+// candidateResolution uses the name first; Premiumize often returns "." as the
+// name, so then it falls back to the client's hint.
+func candidateResolution(c filesCandidate) string {
+	res := detectResolution(c.name)
+	if res != resolutionUnknown {
+		return res
+	}
+	hint := strings.ToLower(strings.TrimSpace(c.hint))
+	if hint == "4k" {
+		hint = "2160p"
+	}
+	if slices.Contains(knownResolutions, hint) {
+		return hint
+	}
+	return resolutionUnknown
 }
 
 // selectForFiles returns the indexes of candidates that should get a file
@@ -80,7 +98,7 @@ type filesCandidate struct {
 func selectForFiles(candidates []filesCandidate, limits map[string]int) []int {
 	byRes := map[string][]int{}
 	for i, c := range candidates {
-		res := detectResolution(c.name)
+		res := candidateResolution(c)
 		byRes[res] = append(byRes[res], i)
 	}
 	selected := []int{}

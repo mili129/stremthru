@@ -211,6 +211,9 @@ type CheckMagnetParams struct {
 	SId              string
 	LocalOnly        bool
 	IsTrustedRequest bool
+	// [local patch] resolution per hash (lowercase), sent by the client in
+	// the `res` query param; used when the store does not give a usable name.
+	ResolutionHints map[string]string
 }
 
 type CheckMagnetDataItem struct {
