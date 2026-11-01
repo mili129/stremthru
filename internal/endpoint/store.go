@@ -43,7 +43,7 @@ type AddMagnetPayload struct {
 	Torrent string `json:"torrent"`
 }
 
-func checkMagnet(r *http.Request, ctx *storecontext.Context, magnets []string, sid string, localOnly bool) (*store.CheckMagnetData, error) {
+func checkMagnet(r *http.Request, ctx *storecontext.Context, magnets []string, sid string, localOnly bool, resolutionHints map[string]string) (*store.CheckMagnetData, error) {
 	log := server.GetReqCtx(r).Log
 
 	basicInfoByHashCh := make(chan map[string]torrent_info.BasicInfo, 1)
@@ -60,6 +60,7 @@ func checkMagnet(r *http.Request, ctx *storecontext.Context, magnets []string, s
 	params.Magnets = magnets
 	params.SId = sid
 	params.LocalOnly = localOnly
+	params.ResolutionHints = resolutionHints
 	if ctx.ClientIP != "" {
 		params.ClientIP = ctx.ClientIP
 	}
@@ -161,8 +162,21 @@ func handleStoreMagnetsCheck(w http.ResponseWriter, r *http.Request) {
 
 	sid := queryParams.Get("sid")
 
+	// [local patch] optional `res` param: comma separated resolutions,
+	// aligned with `magnet` (e.g. Comet sends 2160p,1080p,unknown,...).
+	var resolutionHints map[string]string
+	if res := queryParams.Get("res"); res != "" {
+		if hints := strings.Split(res, ","); len(hints) == len(magnets) {
+			resolutionHints = make(map[string]string, len(magnets))
+			for i, m := range magnets {
+				resolutionHints[strings.ToLower(m)] = hints[i]
+			}
+		}
+		rCtx.ReqQuery.Set("res", "..."+strconv.Itoa(len(resolutionHints))+" items...")
+	}
+
 	ctx := storecontext.Get(r)
-	data, err := checkMagnet(r, ctx, magnets, sid, queryParams.Get("local_only") != "")
+	data, err := checkMagnet(r, ctx, magnets, sid, queryParams.Get("local_only") != "", resolutionHints)
 	if err == nil && data != nil {
 		for _, item := range data.Items {
 			item.Hash = strings.ToLower(item.Hash)

@@ -342,7 +342,7 @@ func (c *StoreClient) checkMagnet(params *store.CheckMagnetParams, includeLinkAn
 			for idx, item := range items {
 				if item.Status == store.MagnetStatusCached {
 					refs = append(refs, cachedRef{ci, idx})
-					candidates = append(candidates, filesCandidate{name: item.Name, size: item.Size})
+					candidates = append(candidates, filesCandidate{name: item.Name, size: item.Size, hint: params.ResolutionHints[strings.ToLower(item.Hash)]})
 				}
 			}
 		}
