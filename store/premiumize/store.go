@@ -285,6 +285,12 @@ func (c *StoreClient) checkMagnet(params *store.CheckMagnetParams, includeLinkAn
 				ccParams.APIKey = params.APIKey
 				start := time.Now()
 				res, err := c.client.CheckCache(ccParams)
+				// [local patch] Premiumize rate limits are short bursts: retry a
+				// 429 twice (after 1 s, then 2 s) instead of returning nothing.
+				for attempt := 1; attempt <= 2 && err != nil && strings.Contains(err.Error(), "TOO_MANY_REQUESTS"); attempt++ {
+					time.Sleep(time.Duration(attempt) * time.Second)
+					res, err = c.client.CheckCache(ccParams)
+				}
 				stats.Record(c.Name, "check_torz", time.Since(start), err != nil)
 				if err != nil {
 					hasError = true
