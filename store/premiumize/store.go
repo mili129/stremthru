@@ -529,6 +529,9 @@ var premiumizeCheckConcurrency = func() int {
 	return 4
 }()
 
+// [local patch] create the account folder for cached magnets on AddMagnet.
+var premiumizeCachedFolders = os.Getenv("STREMTHRU_PREMIUMIZE_CACHED_FOLDERS") == "true"
+
 type CachedMagnetId string
 
 const CachedMagnetIdPrefix = "premiumize:cached:magnet:"
@@ -641,8 +644,15 @@ func (c *StoreClient) AddMagnet(params *store.AddMagnetParams) (*store.AddMagnet
 	if cm.Status == store.MagnetStatusCached {
 		id := CachedMagnetId("").toId(magnet.Hash).toString()
 
-		if _, err = c.ensureFolder(params.APIKey, id); err != nil {
-			return nil, err
+		// [local patch] the empty "premiumize:cached:magnet:<hash>" folder only
+		// makes the magnet show up in ListMagnets (account library). Playback
+		// does not need it: it costs 1-2 Premiumize calls per play and leaves an
+		// empty folder in the account. Set STREMTHRU_PREMIUMIZE_CACHED_FOLDERS=true
+		// to create it again.
+		if premiumizeCachedFolders {
+			if _, err = c.ensureFolder(params.APIKey, id); err != nil {
+				return nil, err
+			}
 		}
 
 		name := magnet.Name
