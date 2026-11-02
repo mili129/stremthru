@@ -155,8 +155,12 @@ func handleStoreMagnetsCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(magnets) > 500 {
-		shared.ErrorBadRequest(r, "too many magnets, max allowed 500").Send(w, r)
+	// [local patch] up to 2000 magnets per check (was 500), so a client can
+	// send all of a title's torrents at once and STREMTHRU_PREMIUMIZE_FILES_LIMITS
+	// applies per title instead of per 500. Premiumize is still asked in
+	// chunks of 100 by the store.
+	if len(magnets) > 2000 {
+		shared.ErrorBadRequest(r, "too many magnets, max allowed 2000").Send(w, r)
 		return
 	}
 
