@@ -274,11 +274,27 @@ func (c *StoreClient) checkMagnet(params *store.CheckMagnetParams, includeLinkAn
 		chunkCount := len(missingHashes)/100 + 1
 		cItems := make([][]store.AddMagnetData, chunkCount)
 		errs := make([]error, chunkCount)
-		hasError := false
 
+		// [local patch] file lists already stored for these hashes. A torrent's
+		// files never change, so a stale magnet that is still cached reuses them
+		// instead of a new directdl call. Not for playback, which needs links.
+		knownFilesByHash := map[string]torrent_stream.Files{}
+		if !includeLinkAndPath {
+			if fbh, err := torrent_stream.GetFilesByHashes(missingHashes); err == nil {
+				knownFilesByHash = fbh
+			} else {
+				log.Warn("failed to get stored magnet files", "error", err)
+			}
+		}
+
+		// [local patch] at most premiumizeCheckConcurrency cache/check calls at
+		// once; a big title used to send up to 20 together (bursts -> 429).
+		checkSem := make(chan struct{}, premiumizeCheckConcurrency)
 		var wg sync.WaitGroup
 		for i, cMissingHashes := range slices.Collect(slices.Chunk(missingHashes, 100)) {
 			wg.Go(func() {
+				checkSem <- struct{}{}
+				defer func() { <-checkSem }()
 				ccParams := &CheckCacheParams{
 					Items: cMissingHashes,
 				}
@@ -293,7 +309,6 @@ func (c *StoreClient) checkMagnet(params *store.CheckMagnetParams, includeLinkAn
 				}
 				stats.Record(c.Name, "check_torz", time.Since(start), err != nil)
 				if err != nil {
-					hasError = true
 					errs[i] = err
 					return
 				}
@@ -302,7 +317,6 @@ func (c *StoreClient) checkMagnet(params *store.CheckMagnetParams, includeLinkAn
 				for idx, is_cached := range res.Data.Response {
 					magnet, err := core.ParseMagnetLink(ccParams.Items[idx])
 					if err != nil {
-						hasError = true
 						errs[i] = err
 						return
 					}
@@ -330,6 +344,8 @@ func (c *StoreClient) checkMagnet(params *store.CheckMagnetParams, includeLinkAn
 			})
 		}
 		wg.Wait()
+		// [local patch] computed after Wait (was set from the goroutines)
+		hasError := slices.ContainsFunc(errs, func(err error) bool { return err != nil })
 
 		// [local patch] a failed chunk no longer discards the other chunks;
 		// fail only if every chunk failed.
@@ -344,9 +360,19 @@ func (c *StoreClient) checkMagnet(params *store.CheckMagnetParams, includeLinkAn
 		type cachedRef struct{ chunk, idx int }
 		refs := []cachedRef{}
 		candidates := []filesCandidate{}
+		reused := 0
 		for ci, items := range cItems {
 			for idx, item := range items {
 				if item.Status == store.MagnetStatusCached {
+					// [local patch] stored file list from Premiumize: no directdl, not
+					// counted in the limits (lists from other stores may differ in Idx)
+					if known := knownFilesByHash[strings.ToLower(item.Hash)]; len(known) > 0 && !slices.ContainsFunc(known, func(f torrent_stream.File) bool { return f.Source != string(c.GetName().Code()) }) {
+						if files := known.ToStoreMagnetFiles(strings.ToLower(item.Hash)); len(files) > 0 {
+							cItems[ci][idx].Files = files
+							reused++
+							continue
+						}
+					}
 					refs = append(refs, cachedRef{ci, idx})
 					candidates = append(candidates, filesCandidate{name: item.Name, size: item.Size, hint: params.ResolutionHints[strings.ToLower(item.Hash)]})
 				}
@@ -386,8 +412,8 @@ func (c *StoreClient) checkMagnet(params *store.CheckMagnetParams, includeLinkAn
 				failed++
 			}
 		}
-		if hasError || failed > 0 || len(selected) < len(refs) {
-			log.Info("cached magnet files", "hashes", len(missingHashes), "cached", len(refs), "fetched", len(selected)-failed, "skipped", len(refs)-len(selected), "failed", failed, "first_error", firstError(append(fileErrs, errs...)))
+		if hasError || failed > 0 || len(selected) < len(refs) || reused > 0 {
+			log.Info("cached magnet files", "hashes", len(missingHashes), "cached", len(refs)+reused, "reused", reused, "fetched", len(selected)-failed, "skipped", len(refs)-len(selected), "failed", failed, "first_error", firstError(append(fileErrs, errs...)))
 		}
 		if failed > 0 && failed == len(selected) {
 			return nil, errors.Join(fileErrs...)
@@ -404,6 +430,11 @@ func (c *StoreClient) checkMagnet(params *store.CheckMagnetParams, includeLinkAn
 		Items: []store.CheckMagnetDataItem{},
 	}
 	tInfos := []buddy.TorrentInfoInput{}
+	// [local patch] hashes Premiumize answered as not cached; stored in
+	// magnet_cache so they are not asked again until the uncached stale time
+	// (STREMTHRU_STORE_CONTENT_CACHED_STALE_TIME). Before, only cached ones
+	// were stored, so every check asked again about all the others.
+	notCached := map[string]bool{}
 	for _, hash := range hashes {
 		if item, ok := foundItemByHash[hash]; ok {
 			data.Items = append(data.Items, item)
@@ -421,6 +452,9 @@ func (c *StoreClient) checkMagnet(params *store.CheckMagnetParams, includeLinkAn
 			Hash: hash,
 		}
 		if it, ok := itemByHash[hash]; ok {
+			if it.Status != store.MagnetStatusCached {
+				notCached[hash] = false
+			}
 			item.Name = it.Name
 			item.Size = it.Size
 			tInfo.TorrentTitle = it.Name
@@ -452,7 +486,7 @@ func (c *StoreClient) checkMagnet(params *store.CheckMagnetParams, includeLinkAn
 		tInfos = append(tInfos, tInfo)
 		data.Items = append(data.Items, item)
 	}
-	go buddy.BulkTrackMagnet(c, tInfos, nil, "", params.GetAPIKey(c.client.apiKey))
+	go buddy.BulkTrackMagnet(c, tInfos, notCached, "", params.GetAPIKey(c.client.apiKey))
 	return data, nil
 }
 
@@ -484,6 +518,15 @@ var premiumizeFilesConcurrency = func() int {
 		return v
 	}
 	return 8
+}()
+
+// [local patch] parallel cache/check calls (100 hashes each). Override with
+// STREMTHRU_PREMIUMIZE_CHECK_CONCURRENCY.
+var premiumizeCheckConcurrency = func() int {
+	if v, err := strconv.Atoi(os.Getenv("STREMTHRU_PREMIUMIZE_CHECK_CONCURRENCY")); err == nil && v > 0 {
+		return v
+	}
+	return 4
 }()
 
 type CachedMagnetId string
