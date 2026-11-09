@@ -227,6 +227,8 @@ type CheckMagnetDataItem struct {
 
 type CheckMagnetData struct {
 	Items []CheckMagnetDataItem `json:"items"`
+	// [local patch] true when part of the check failed at the store
+	Partial bool `json:"partial,omitempty"`
 }
 
 type AddMagnetData struct {

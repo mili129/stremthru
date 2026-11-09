@@ -257,7 +257,9 @@ func BulkTouch(storeCode store.StoreCode, filesByHash map[string]torrent_stream.
 	for hash, is_cached := range cached {
 		cacheKey := writeCacheKey(storeCode, hash)
 		var prevIsCached bool
-		if prevIsCachedCache.Get(cacheKey, &prevIsCached) && prevIsCached == is_cached {
+		// [local patch] misses always reach the query below, so their
+		// modified_at can be refreshed (see missStaleThreshold)
+		if is_cached && prevIsCachedCache.Get(cacheKey, &prevIsCached) && prevIsCached == is_cached {
 			writeCacheHitCount.Add(1)
 			continue
 		}
@@ -303,8 +305,16 @@ func BulkTouch(storeCode store.StoreCode, filesByHash map[string]torrent_stream.
 	}
 
 	if miss_count > 0 {
+		// [local patch] a miss confirmed again by the store is refreshed once it
+		// is older than the uncached stale time (it was refreshed only after
+		// 24 h, so with a 1 h stale time it was asked again on every check for
+		// the other 23 h).
+		missStaleThreshold := staleThreshold
+		if d := config.StoreContentCachedStaleTime.GetStaleTime(false, string(storeCode.Name())); d > 0 && d < 24*time.Hour {
+			missStaleThreshold = db.Timestamp{Time: time.Now().Add(-d)}
+		}
 		miss_query.WriteString(query_bulk_touch_on_conflict)
-		miss_args = append(miss_args, staleThreshold)
+		miss_args = append(miss_args, missStaleThreshold)
 		_, err := db.Exec(miss_query.String(), miss_args...)
 		if err != nil {
 			mcLog.Error("failed to touch misses", "error", err)

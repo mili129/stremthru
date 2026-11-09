@@ -202,10 +202,17 @@ func (c *StoreClient) getCachedMagnetFiles(apiKey string, magnet string, include
 	files := []store.MagnetFile{}
 	source := string(c.GetName().Code())
 	for idx, f := range res.Data.Content {
+		// [local patch] a single-file torrent has no root folder, so GetPath()
+		// returns "" and the file list was never stored (torrent_stream wants a
+		// path starting with "/"): it was fetched again every day and never reused.
+		fPath := f.GetPath()
+		if fPath == "" && strings.Trim(f.Path, "/") != "" {
+			fPath = "/" + f.GetName()
+		}
 		file := &store.MagnetFile{
 			Idx:    idx,
 			Name:   f.GetName(),
-			Path:   f.GetPath(),
+			Path:   fPath,
 			Size:   f.Size,
 			Source: source,
 		}
@@ -270,6 +277,7 @@ func (c *StoreClient) checkMagnet(params *store.CheckMagnetParams, includeLinkAn
 	}
 
 	itemByHash := map[string]store.AddMagnetData{}
+	partial := false
 	if len(missingHashes) > 0 {
 		chunkCount := len(missingHashes)/100 + 1
 		cItems := make([][]store.AddMagnetData, chunkCount)
@@ -289,12 +297,15 @@ func (c *StoreClient) checkMagnet(params *store.CheckMagnetParams, includeLinkAn
 
 		// [local patch] at most premiumizeCheckConcurrency cache/check calls at
 		// once; a big title used to send up to 20 together (bursts -> 429).
-		checkSem := make(chan struct{}, premiumizeCheckConcurrency)
+		// The semaphore is shared by all requests (it was per request, so two
+		// titles opened together doubled the limit). Playback does not wait.
 		var wg sync.WaitGroup
 		for i, cMissingHashes := range slices.Collect(slices.Chunk(missingHashes, 100)) {
 			wg.Go(func() {
-				checkSem <- struct{}{}
-				defer func() { <-checkSem }()
+				if !includeLinkAndPath {
+					premiumizeCheckSem <- struct{}{}
+					defer func() { <-premiumizeCheckSem }()
+				}
 				ccParams := &CheckCacheParams{
 					Items: cMissingHashes,
 				}
@@ -389,13 +400,15 @@ func (c *StoreClient) checkMagnet(params *store.CheckMagnetParams, includeLinkAn
 		}
 		selected := selectForFiles(candidates, limits)
 		fileErrs := make([]error, len(selected))
-		sem := make(chan struct{}, premiumizeFilesConcurrency)
+		// [local patch] shared by all requests, like premiumizeCheckSem
 		var fwg sync.WaitGroup
 		for j, sel := range selected {
 			ref := refs[sel]
 			fwg.Go(func() {
-				sem <- struct{}{}
-				defer func() { <-sem }()
+				if !includeLinkAndPath {
+					premiumizeFilesSem <- struct{}{}
+					defer func() { <-premiumizeFilesSem }()
+				}
 				item := &cItems[ref.chunk][ref.idx]
 				files, err := c.getCachedMagnetFiles(params.APIKey, item.Magnet, includeLinkAndPath)
 				if err != nil {
@@ -415,9 +428,13 @@ func (c *StoreClient) checkMagnet(params *store.CheckMagnetParams, includeLinkAn
 		if hasError || failed > 0 || len(selected) < len(refs) || reused > 0 {
 			log.Info("cached magnet files", "hashes", len(missingHashes), "cached", len(refs)+reused, "reused", reused, "fetched", len(selected)-failed, "skipped", len(refs)-len(selected), "failed", failed, "first_error", firstError(append(fileErrs, errs...)))
 		}
-		if failed > 0 && failed == len(selected) {
+		// [local patch] reused lists are still good when every new listing failed
+		if failed > 0 && failed == len(selected) && reused == 0 {
 			return nil, errors.Join(fileErrs...)
 		}
+		// [local patch] tell the client the answer is incomplete (a cache/check
+		// chunk or a file listing failed), so it does not remember it as final.
+		partial = hasError || failed > 0
 
 		for _, items := range cItems {
 			for _, item := range items {
@@ -427,7 +444,8 @@ func (c *StoreClient) checkMagnet(params *store.CheckMagnetParams, includeLinkAn
 	}
 
 	data := &store.CheckMagnetData{
-		Items: []store.CheckMagnetDataItem{},
+		Items:   []store.CheckMagnetDataItem{},
+		Partial: partial,
 	}
 	tInfos := []buddy.TorrentInfoInput{}
 	// [local patch] hashes Premiumize answered as not cached; stored in
@@ -528,6 +546,10 @@ var premiumizeCheckConcurrency = func() int {
 	}
 	return 4
 }()
+
+// [local patch] one semaphore each for the whole process, not per request
+var premiumizeCheckSem = make(chan struct{}, premiumizeCheckConcurrency)
+var premiumizeFilesSem = make(chan struct{}, premiumizeFilesConcurrency)
 
 // [local patch] create the account folder for cached magnets on AddMagnet.
 var premiumizeCachedFolders = os.Getenv("STREMTHRU_PREMIUMIZE_CACHED_FOLDERS") == "true"

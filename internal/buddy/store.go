@@ -192,7 +192,10 @@ func CheckMagnet(s store.Store, hashes []string, storeToken string, clientIp str
 			continue
 		}
 		magnetByHash[magnet.Hash] = magnet
-		if mc, ok := mcByHash[magnet.Hash]; ok && !mc.IsStale() {
+		// [local patch] a Premiumize magnet remembered as cached but without a
+		// stored file list is useless to the client (no files = not playable):
+		// ask the store again instead of answering "cached" with no files.
+		if mc, ok := mcByHash[magnet.Hash]; ok && !mc.IsStale() && !(mc.IsCached && len(mc.Files) == 0 && s.GetName() == store.StoreNamePremiumize) {
 			item := store.CheckMagnetDataItem{
 				Hash:   magnet.Hash,
 				Magnet: magnet.Link,
